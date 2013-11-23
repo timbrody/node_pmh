@@ -1,0 +1,17 @@
+{
+  "name": "oai_pmh",
+  "version": "0.0.0",
+  "description": "Open Archives Initiative Protocol for Metadata Harvesting",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Tim Brody",
+  "license": "BSD-2-Clause",
+  "dependencies": {
+    "node-expat": "*",
+    "generic-pool": "*",
+    "mysql": "*",
+    "node-promise": "*"
+  }
+}
