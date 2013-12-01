@@ -12,6 +12,7 @@
     "node-expat": "*",
     "generic-pool": "*",
     "mysql": "*",
-    "node-promise": "*"
+    "node-promise": "*",
+	"express": "*"
   }
 }

@@ -18,18 +18,50 @@ var Harvester = function(options) {
 util.inherits(Harvester, EventEmitter);
 exports.Harvester = Harvester;
 
+exports.dcTerms = function() {
+	return [
+		"contributor",
+		"coverage",
+		"creator",
+		"date",
+		"description",
+		"format",
+		"header",
+		"identifier",
+		"language",
+		"publisher",
+		"relation",
+		"rights",
+		"source",
+		"subject",
+		"title",
+		"type"
+	];
+};
+
 Harvester.prototype.stop = function() {
   if (this.parser) this.parser.stop();
+  this.paused = true;
 };
 
 Harvester.prototype.resume = function() {
   if (this.parser) this.parser.resume();
+  this.paused = undefined;
+  if (this.request_options) {
+    this.request(this.endpoint, this.request_options);
+    this.request_options = undefined;
+  }
 };
 
 Harvester.prototype.request = function(endpoint, options) {
   var _this = this;
   this.endpoint = url.parse(endpoint);
   if (!options) options = {};
+
+  if (this.paused) {
+    this.request_options = options;
+    return;
+  }
 
   var parser = new expat.Parser("UTF-8");
   this.parser = parser; // used to pause
@@ -59,6 +91,9 @@ Harvester.prototype.request = function(endpoint, options) {
     path.push(localName);
     //console.log('<' + path.join('/') + '>');
     text = '';
+    if (path.join('/') === 'OAI-PMH/ListRecords/record/header') {
+      record.status = attrs.status;
+    }
   });
   parser.on('text', function(t) {
     _this.emit('text', t);
@@ -71,6 +106,9 @@ Harvester.prototype.request = function(endpoint, options) {
     var localName = name.replace(/^.+:/,'');
     if (path.join('/') === 'OAI-PMH/ListRecords/record/header/identifier') {
       record.identifier = text;
+    }
+    if (path.join('/') === 'OAI-PMH/ListRecords/record/header/datestamp') {
+      record.datestamp = text;
     }
     else if (path.join('/') === 'OAI-PMH/ListRecords/record') {
       _this.emit('record', record);

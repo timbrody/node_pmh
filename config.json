@@ -1,8 +1,11 @@
 {
   "database": {
     "host": "localhost",
-    "database": "test",
-    "user": "test",
+    "database": "celestial",
+    "user": "oaia",
     "password": ""
-  }
+  },
+  "controller": {
+	  "port": 40404
+	}
 }
