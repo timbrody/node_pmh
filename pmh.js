@@ -48,7 +48,6 @@ Harvester.prototype.request = function(endpoint, options) {
 
   var path = [];
   var text = '';
-  var records = [];
   var record = {
     dc: {}
   };
@@ -74,16 +73,10 @@ Harvester.prototype.request = function(endpoint, options) {
       record.identifier = text;
     }
     else if (path.join('/') === 'OAI-PMH/ListRecords/record') {
-      records.push(record);
+      _this.emit('record', record);
       record = {
         dc: {}
       };
-      if (records.length > _this.flush) {
-        _this.state.status = 'Flushing';
-        while(records.length > 0) {
-          _this.emit('record', records.shift());
-        }
-      }
     }
     else if (path.join('/') === 'OAI-PMH/ListRecords/resumptionToken') {
       resumptionToken = text.replace(/\s+/, '');
@@ -102,20 +95,18 @@ Harvester.prototype.request = function(endpoint, options) {
   console.log(q.format());
   _this.state.status = 'Requesting';
   var req = http.request(q.format(), function(res) {
+    _this.state.status = 'Receiving';
     res.on('data', function(data) {
-      _this.state.status = 'Receiving';
+      _this.state.status = 'Parsing';
       parser.write(data);
+      _this.state.status = 'Receiving';
     });
     res.on('end', function() {
       // tidy up parser
       parser.end();
       _this.parser = undefined;
-
-      _this.state.status = 'Flushing';
-      // emit the collected records
-      while(records.length > 0) {
-        _this.emit('record', records.shift());
-      }
+ 
+      _this.state.status = 'Finished';
 
       // resume the partial list with the given token
       if (resumptionToken) {
