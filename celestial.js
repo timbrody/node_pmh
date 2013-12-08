@@ -4,17 +4,22 @@ var
   , mysql = require('mysql')
   , promise = require('node-promise')
   , Promise = require('node-promise').Promise
+  , EventEmitter = require('events').EventEmitter
+  , util = require('util')
 ;
 
 var celestial = function(opts) {
+  EventEmitter.call(this);
 	this.opts = opts;
   this.harvesters = {};
 	this.initialize();
 };
+util.inherits(celestial, EventEmitter);
 exports = module.exports = function(opts) {
 	return new celestial(opts);
 };
 
+var written = {};
 celestial.prototype.initialize = function() {
 	var _this = this;
 	this.pool = poolModule.Pool({
@@ -22,10 +27,10 @@ celestial.prototype.initialize = function() {
 	  name: 'mysql',
 	  create: function(callback) {
 		var connection = mysql.createConnection({
-		  host: _this.opts.host,
-		  database: _this.opts.database,
-		  user: _this.opts.user,
-		  password: _this.opts.password
+		  host: _this.opts.database.host,
+		  database: _this.opts.database.database,
+		  user: _this.opts.database.user,
+		  password: _this.opts.database.password
 		});
 		connection.connect();
 
@@ -36,33 +41,87 @@ celestial.prototype.initialize = function() {
 	  },
 	  max: 10,
 	  min: 2,
-	  idleTimeoutMillis: 30000
+	  idleTimeoutMillis: 30000,
+    priorityRange: 2
 	});
 };
 
-celestial.prototype.start = function(celestialid, endpoint) {
-	var _this = this;
-	var Harvester = new pmh.Harvester();
-  this.harvesters[celestialid] = Harvester;
+celestial.prototype.log = function(err) {
+  console.log(err);
+};
 
-	Harvester
+celestial.prototype.start = function(repo) {
+	var _this = this
+    , celestialid = repo.celestialid
+    , oai_dc
+  ;
+  for(var i=0; i<repo.formats.length; ++i) {
+    if (repo.formats[i].prefix === 'oai_dc') {
+      oai_dc = repo.formats[i];
+    }
+  }
+
+	var harvester = new pmh.Harvester({
+    headers: this.opts.headers
+  });
+  this.harvesters[celestialid] = harvester;
+
+  var tokens = [];
+
+	harvester
   .on('record', function(record) {
 		_this.record({
-      harvester: Harvester,
+      harvester: harvester,
       celestialid: celestialid,
       record: record
     });
 	})
+  .on('resume', function(opts, next) {
+    var seen = false;
+    for(var i=0; i < tokens; ++i) {
+      if (opts.resumptionToken === tokens[i]) {
+        seen = true;
+        break;
+      }
+    }
+    if (seen) {
+      harvester.emit('error', 'Resumption token repeated: ' + opts.resumptionToken);
+    }
+    else {
+      while(tokens.length >= 20) {
+        tokens.shift();
+      }
+      tokens.push(opts.resumptionToken);
+      // wait until all database writes are complete before continuing
+      _this.pool.acquire(function(err, connection) {
+        _this.pool.release(connection);
+        next();
+      }, 1);
+    }
+  })
   .on('end', function() {
-    _this.harvesters[celestialid] = undefined;
+    delete _this.harvesters[celestialid];
   })
   .on('error', function(err) {
-    console.log(err);
-    _this.harvesters[celestialid] = undefined;
+    delete _this.harvesters[celestialid];
   })
   ;
 
-	Harvester.request(endpoint);
+  // wait until all database writes are complete before continuing
+  _this.pool.acquire(function(err, connection) {
+    _this.pool.release(connection);
+    var opts = {};
+    if (oai_dc.token) {
+      opts.resumptionToken = oai_dc.token;
+    }
+    else if (oai_dc.harvest && oai_dc.harvest.length) {
+      var from = new Date(oai_dc.harvest);
+      opts.from = from.toISOString().substring(0,10);
+    }
+    harvester.request(repo.url, opts);
+  }, 1);
+
+  return harvester;
 };
 
 celestial.prototype.stop = function(celestialid) {
@@ -70,14 +129,15 @@ celestial.prototype.stop = function(celestialid) {
     return;
   }
   this.harvesters[celestialid].stop();
-  this.harvesters[celestialid] = undefined;
+  delete this.harvesters[celestialid];
 };
 
-celestial.prototype.getStatus = function(celestialid) {
-  if (this.harvesters[celestialid] === undefined) {
-    return;
+celestial.prototype.currentState = function() {
+  var result = {};
+  for(var celestialid in this.harvesters) {
+    result[celestialid] = this.harvesters[celestialid].state;
   }
-  return this.harvesters[celestialid].state.status;
+  return result;
 };
 
 celestial.prototype.record = function(opts) {
@@ -85,17 +145,20 @@ celestial.prototype.record = function(opts) {
     , pool = this.pool
     , celestialid = opts.celestialid
     , record = opts.record
+    , harvester = opts.harvester
   ;
 
   pool.acquire(function(err, connection) {
     if (err) {
       _this.stop(celestialid);
-      console.log(err);
+      _this.log({
+        celestialid: celestialid,
+        harvester: harvester,
+        error: err
+      });
     }
     else {
-      var first = new Promise();
-      first
-      .then(function() {
+      var begin = function(ok) {
         var p = new Promise();
 
         connection.query('BEGIN', [], function(err) {
@@ -103,12 +166,30 @@ celestial.prototype.record = function(opts) {
             p.reject(err);
           }
           else {
-            p.resolve();
+            p.resolve(ok);
           }
         });
 
         return p;
-      })
+      };
+      var commit = function(ok) {
+        var p = new Promise();
+
+        connection.query('COMMIT', [], function(err) {
+          if (err) {
+            p.reject(err);
+          }
+          else {
+            p.resolve(ok);
+          }
+        });
+
+        return p;
+      };
+
+      var first = new Promise();
+      first
+      .then(begin)
       .then(function() {
         var p = new Promise();
 
@@ -150,6 +231,10 @@ celestial.prototype.record = function(opts) {
         return p;
       })
       .then(function(id) {
+        return commit(id);
+      })
+      .then(function(id) {
+        // commit the foreign key or we get deadlocks on the main table
         var sql = [];
 
         var terms = pmh.dcTerms();
@@ -157,9 +242,11 @@ celestial.prototype.record = function(opts) {
           var table = 'dc_' + terms[i];
           var term = terms[i];
 
+          sql.push('BEGIN');
           sql.push('DELETE FROM ' + table + ' WHERE dcid=' + id);
 
           if (record.dc[term] === undefined) {
+            sql.push('COMMIT');
             continue;
           }
 
@@ -173,6 +260,7 @@ celestial.prototype.record = function(opts) {
           }
 
           sql.push('INSERT INTO ' + table + ' (dcid,pos,' + term + ') VALUES ' + values.join(','));
+          sql.push('COMMIT');
         }
 
         var promises = [];
@@ -183,7 +271,7 @@ celestial.prototype.record = function(opts) {
             promises.push(function() {
               var p = new Promise();
               connection.query(sql, [], function(err) {
-                if (0 && err) {
+                if (err) {
                   p.reject(err);
                 }
                 else {
@@ -200,20 +288,25 @@ celestial.prototype.record = function(opts) {
 
       // release the connection and report
       .then(function(id) {
-        connection.query('COMMIT', [], function(err) {
-          pool.release(connection);
-          if (err) {
-            console.log(err);
-          }
-          else {
-            console.log(record.identifier);
-          }
-        });
+        pool.release(connection);
+        //console.log(record.identifier);
       }, function(err) {
-        connection.query('ROLLBACK', [], function() {
-          console.log(err, celestialid, record.identifier);
+        // Deadlock
+        if (err.errno == 1213) {
+          // try again (that's what the MySQL manual says)
           pool.release(connection);
-        });
+          _this.record(opts);
+        }
+        else {
+          connection.query('ROLLBACK', [], function() {
+            _this.log({
+              celestialid: celestialid,
+              harvester: harvester,
+              error: err
+            });
+            pool.release(connection);
+          });
+        }
       });
 
       first.resolve();

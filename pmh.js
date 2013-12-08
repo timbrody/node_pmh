@@ -1,4 +1,5 @@
 var http = require('http')
+  , https = require('https')
   , url = require('url')
   , expat = require('node-expat')
   , EventEmitter = require('events').EventEmitter
@@ -10,10 +11,21 @@ var Harvester = function(options) {
 
   if (!options) options = {};
 
-  this.flush = options.flush ? options.flush : 300;
+  this.headers = options.headers ? options.headers : {};
 
   // state variables, useful for monitoring
-  this.state = {};
+  this.state = {
+      status: 'Initialization',
+      request: null,
+      requests: 0,
+      records: 0,
+      start: 0
+    };
+
+  // cache recent rtokens to spot unchanging tokens
+  this.tokens = [];
+
+  this.retries = 5;
 };
 util.inherits(Harvester, EventEmitter);
 exports.Harvester = Harvester;
@@ -44,29 +56,25 @@ Harvester.prototype.stop = function() {
   this.paused = true;
 };
 
-Harvester.prototype.resume = function() {
-  if (this.parser) this.parser.resume();
-  this.paused = undefined;
-  if (this.request_options) {
-    this.request(this.endpoint, this.request_options);
-    this.request_options = undefined;
-  }
-};
-
 Harvester.prototype.request = function(endpoint, options) {
   var _this = this;
   this.endpoint = url.parse(endpoint);
   if (!options) options = {};
 
   if (this.paused) {
-    this.request_options = options;
     return;
   }
+
+  // general state
+  if (this.state.start == 0) {
+    this.state.start = new Date().getTime();
+  }
+  this.state.requests++;
 
   var parser = new expat.Parser("UTF-8");
   this.parser = parser; // used to pause
 
-  var q = url.parse(this.endpoint.format());
+  var q = url.parse(this.endpoint.format().replace(/\?.*/, ''));
 
   q.query = {};
   q.query.verb = 'ListRecords';
@@ -81,7 +89,8 @@ Harvester.prototype.request = function(endpoint, options) {
   var path = [];
   var text = '';
   var record = {
-    dc: {}
+    dc: {},
+    setSpec: []
   };
   var resumptionToken;
   parser.on('startElement', function(name, attrs) {
@@ -91,7 +100,7 @@ Harvester.prototype.request = function(endpoint, options) {
     path.push(localName);
     //console.log('<' + path.join('/') + '>');
     text = '';
-    if (path.join('/') === 'OAI-PMH/ListRecords/record/header') {
+    if (path.join('/') === 'OAI-PMH/ListRecords/record/header' && record.status !== '') {
       record.status = attrs.status;
     }
   });
@@ -105,15 +114,20 @@ Harvester.prototype.request = function(endpoint, options) {
 
     var localName = name.replace(/^.+:/,'');
     if (path.join('/') === 'OAI-PMH/ListRecords/record/header/identifier') {
-      record.identifier = text;
+      record.identifier = text.replace(/\s+/, '');
     }
-    if (path.join('/') === 'OAI-PMH/ListRecords/record/header/datestamp') {
-      record.datestamp = text;
+    else if (path.join('/') === 'OAI-PMH/ListRecords/record/header/datestamp') {
+      record.datestamp = text.replace(/\s+/, '');
+    }
+    else if (path.join('/') === 'OAI-PMH/ListRecords/record/header/setSpec') {
+      record.setSpec.push(text.replace(/\s+/, ''));
     }
     else if (path.join('/') === 'OAI-PMH/ListRecords/record') {
       _this.emit('record', record);
+      _this.state.records++;
       record = {
-        dc: {}
+        dc: {},
+        setSpec: []
       };
     }
     else if (path.join('/') === 'OAI-PMH/ListRecords/resumptionToken') {
@@ -130,48 +144,82 @@ Harvester.prototype.request = function(endpoint, options) {
     _this.emit('error', e);
   });
 
-  console.log(q.format());
+  //console.log(q.format());
   _this.state.status = 'Requesting';
-  var req = http.request(q.format(), function(res) {
+  _this.state.statusCode = undefined;
+  var req = (q.protocol === 'http:' ? http : https).request(q.format(), function(res) {
     _this.state.status = 'Receiving';
-    res.on('data', function(data) {
-      _this.state.status = 'Parsing';
-      parser.write(data);
-      _this.state.status = 'Receiving';
-    });
-    res.on('end', function() {
-      // tidy up parser
-      parser.end();
-      _this.parser = undefined;
- 
-      _this.state.status = 'Finished';
+    _this.state.statusCode = res.statusCode;
+    switch(res.statusCode) {
+      case 200:
+        res
+        .on('data', function(data) {
+          if (_this.paused) {
+            req.abort();
+            return;
+          }
+          _this.state.status = 'Parsing';
+          parser.write(data);
+          _this.state.status = 'Receiving';
+        })
+        .on('end', function() {
+          // tidy up parser
+          parser.end();
+          _this.parser = undefined;
+     
+          _this.state.status = 'Finished';
+          _this.state.request = undefined;
 
-      // resume the partial list with the given token
-      if (resumptionToken) {
-        var next = function() {
-          _this.request(endpoint, {
-            resumptionToken: resumptionToken
-          });
-        };
-        if (_this.listeners('resume').length > 0) {
-          _this.emit('resume', next);
-        }
-        else {
-          next();
-        }
-      }
+          // resume the partial list with the given token
+          if (resumptionToken !== undefined && resumptionToken.length > 0) {
+            var next = function() {
+              _this.request(endpoint, {
+                resumptionToken: resumptionToken
+              });
+            };
+            if (_this.listeners('resume').length > 0) {
+              _this.emit('resume', {
+                  resumptionToken: resumptionToken
+                }, next);
+            }
+            else {
+              next();
+            }
+          }
 
-      // nothing left to do
-      else {
-        _this.state = {};
-        _this.emit('end');
-      }
-    });
-  });
+          // nothing left to do
+          else {
+            _this.emit('end');
+          }
+        });
+        break;
+      // redirect
+      case 301:
+      case 302:
+        var location = res.headers['location'];
+        location = url.resolve(q.format(), location);
+        _this.state.status = 'Redirecting';
+        _this.request(location, options);
+        break;
+      // retry-after
+      case 503:
+        var seconds = res.headers['retry-after'] + 0;
+        if (seconds > 0 && seconds < 600) {
+          _this.state.status = 'Sleeping';
+          setTimeout(function() {
+            _this.request(endpoint, options);
+          }, (seconds + 5) * 1000);
+          break;
+        }
+      default:
+        _this.emit('error', res.statusCode);
+    }
+
+  }, this.headers);
   req.on('error', function(e) {
     _this.emit('error', e);
   });
   req.end();
 
-  this.state.request = req;
+  this.state.request = q.format();
 };
