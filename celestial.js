@@ -44,6 +44,7 @@ celestial.prototype.initialize = function() {
 	  idleTimeoutMillis: 30000,
     priorityRange: 2
 	});
+  this.state = {};
 };
 
 celestial.prototype.log = function(err) {
@@ -54,6 +55,7 @@ celestial.prototype.start = function(repo) {
 	var _this = this
     , celestialid = repo.celestialid
     , oai_dc
+    , rconnection
   ;
   for(var i=0; i<repo.formats.length; ++i) {
     if (repo.formats[i].prefix === 'oai_dc') {
@@ -65,16 +67,29 @@ celestial.prototype.start = function(repo) {
     headers: this.opts.headers
   });
   this.harvesters[celestialid] = harvester;
+  this.state[celestialid] = {
+    celestialid: celestialid,
+    status: 'waiting',
+    start: new Date(),
+    records: 0,
+    requests: 0
+  };
 
   var tokens = [];
 
+  var record_buffer = [];
+
 	harvester
   .on('record', function(record) {
-		_this.record({
+    record_buffer.push({
       harvester: harvester,
       celestialid: celestialid,
       record: record
     });
+    if (record_buffer.length > 50) {
+      _this.write(record_buffer);
+      record_buffer = [];
+    }
 	})
   .on('resume', function(opts, next) {
     var seen = false;
@@ -92,34 +107,91 @@ celestial.prototype.start = function(repo) {
         tokens.shift();
       }
       tokens.push(opts.resumptionToken);
-      // wait until all database writes are complete before continuing
-      _this.pool.acquire(function(err, connection) {
-        _this.pool.release(connection);
-        next();
-      }, 1);
+      // throttle requests by putting them in the same database-wait queue
+      _this.pool.release(rconnection);
+      setTimeout(function() {
+        _this.pool.acquire(function(err, conn) {
+          rconnection = conn;
+          next();
+        }, 1);
+      // only resume after 5 seconds, to avoid rushing the remote server
+      }, 5000);
     }
   })
   .on('end', function() {
+    _this.write(record_buffer);
+    record_buffer = [];
+    _this.pool.release(rconnection);
     delete _this.harvesters[celestialid];
   })
   .on('error', function(err) {
+    _this.pool.release(rconnection);
     delete _this.harvesters[celestialid];
+  })
+  // state changes
+  .on('request', function(url) {
+    _this.state[celestialid].request = url.format();
+    _this.state[celestialid].requests++;
+    _this.state[celestialid].status = 'requesting';
+    _this.emit('state', _this.state[celestialid]);
+  })
+  .on('response', function(req, res) {
+    _this.state[celestialid].statusCode = res.statusCode;
+    _this.state[celestialid].status = 'parsing';
+    _this.emit('state', _this.state[celestialid]);
+  })
+  .on('response_end', function() {
+    delete _this.state[celestialid].statusCode;
+    _this.state[celestialid].status = 'waiting';
+    _this.emit('state', _this.state[celestialid]);
+  })
+  .on('redirect', function(url) {
+    _this.state[celestialid].request = url;
+    _this.state[celestialid].status = 'redirecting';
+    _this.emit('state', _this.state[celestialid]);
+  })
+  .on('record', function() {
+    _this.state[celestialid].records++;
+    _this.emit('state', _this.state[celestialid]);
+  })
+  .on('error', function(err) {
+    _this.state[celestialid].status = 'error';
+    _this.state[celestialid].statusCode = err;
+    setTimeout(function() {
+      if (_this.state[celestialid].status === 'error') {
+        delete _this.state[celestialid];
+      }
+    }, 10000);
+    _this.emit('state', _this.state[celestialid]);
+  })
+  .on('end', function() {
+    _this.state[celestialid].status = 'finished';
+    _this.emit('state', _this.state[celestialid]);
+    delete _this.state[celestialid];
   })
   ;
 
-  // wait until all database writes are complete before continuing
-  _this.pool.acquire(function(err, connection) {
-    _this.pool.release(connection);
-    var opts = {};
-    if (oai_dc.token) {
-      opts.resumptionToken = oai_dc.token;
-    }
-    else if (oai_dc.harvest && oai_dc.harvest.length) {
-      var from = new Date(oai_dc.harvest);
-      opts.from = from.toISOString().substring(0,10);
-    }
-    harvester.request(repo.url, opts);
-  }, 1);
+  // throttle requests by putting them in the same database-wait queue
+  setTimeout(function() {
+    _this.pool.acquire(function(err, conn) {
+      rconnection = conn;
+      var opts = {};
+      if (oai_dc.token) {
+        opts.resumptionToken = oai_dc.token;
+      }
+      else if (oai_dc.harvest && oai_dc.harvest.length) {
+        var from = new Date(oai_dc.harvest);
+        opts.from = from.toISOString().substring(0,10);
+      }
+      // catch e.g. bad URLs
+      try {
+        harvester.request(repo.url, opts);
+      } catch (err) {
+        harvester.emit('error', err);
+      }
+    }, 1)
+  // allow database writes to get ahead in the pool
+  }, 3000);
 
   return harvester;
 };
@@ -133,6 +205,7 @@ celestial.prototype.stop = function(celestialid) {
 };
 
 celestial.prototype.currentState = function() {
+  return this.state;
   var result = {};
   for(var celestialid in this.harvesters) {
     result[celestialid] = this.harvesters[celestialid].state;
@@ -140,176 +213,154 @@ celestial.prototype.currentState = function() {
   return result;
 };
 
-celestial.prototype.record = function(opts) {
-  var _this = this
-    , pool = this.pool
-    , celestialid = opts.celestialid
-    , record = opts.record
-    , harvester = opts.harvester
-  ;
+// output YYYY-MM-DDThh:mm:ss
+function sqlDateTime(dt) {
+  return new Date(dt).toISOString().substring(0,19);
+}
 
-  pool.acquire(function(err, connection) {
-    if (err) {
-      _this.stop(celestialid);
-      _this.log({
-        celestialid: celestialid,
-        harvester: harvester,
-        error: err
+/* Retrieve and update the record header (or create it if missing).
+ * @param conn SQL connection
+ * @param entry Record entry to retrieve/update
+ */
+celestial.prototype.writeHeader = function(conn, entry) {
+  var p = new Promise();
+
+  var celestialid = entry.celestialid;
+  var record = entry.record;
+
+  var accession = new Date(record.datestamp);
+  if (accession.getFullYear() < 1990 || accession.getTime() > new Date().getTime()) {
+    accession = new Date();
+  }
+  conn.query('INSERT INTO dc (celestialid,status,datestamp,accession,identifier_hash) VALUES(?,?,?,?,UNHEX(SHA2(?,256)))', [celestialid,record.status,sqlDateTime(record.datestamp),sqlDateTime(accession),record.identifier], function(err, result) {
+    if (err && err.errno !== 1062) {
+      p.reject(err);
+    }
+    else if (err) {
+      conn.query('SELECT dcid FROM dc WHERE celestialid=? AND identifier_hash=UNHEX(SHA2(?,256))', [celestialid,record.identifier], function(err, rows) {
+        if (err) {
+          p.reject(err);
+        }
+        else {
+          var dcid = rows[0].dcid;
+          entry.dcid = dcid;
+          conn.query('UPDATE dc SET status=?, datestamp=? WHERE dcid='+dcid, [record.status,sqlDateTime(record.datestamp)]);
+          p.resolve();
+        }
       });
     }
     else {
-      var begin = function(ok) {
-        var p = new Promise();
-
-        connection.query('BEGIN', [], function(err) {
-          if (err) {
-            p.reject(err);
-          }
-          else {
-            p.resolve(ok);
-          }
-        });
-
-        return p;
-      };
-      var commit = function(ok) {
-        var p = new Promise();
-
-        connection.query('COMMIT', [], function(err) {
-          if (err) {
-            p.reject(err);
-          }
-          else {
-            p.resolve(ok);
-          }
-        });
-
-        return p;
-      };
-
-      var first = new Promise();
-      first
-      .then(begin)
-      .then(function() {
-        var p = new Promise();
-
-        connection.query('SELECT dcid FROM dc WHERE celestialid=? AND identifier_hash=UNHEX(SHA2(?,256))', [celestialid,record.identifier], function(err, rows) {
-          if (err) {
-            p.reject(err);
-          }
-          else {
-            p.resolve(rows.length > 0 ? rows[0].dcid : undefined);
-          }
-        });
-
-        return p;
-      })
-      .then(function(id) {
-        var p = new Promise();
-
-        if (id !== undefined) {
-          connection.query('UPDATE dc SET status=? AND datestamp=? WHERE dcid=?', [record.status,record.datestamp,id], function(err, result) {
-            if (err) {
-              p.reject(err);
-            }
-            else {
-              p.resolve(id);
-            }
-          });
-        }
-        else {
-          connection.query('INSERT INTO dc (celestialid,status,datestamp,identifier_hash) VALUES(?,?,?,UNHEX(SHA2(?,256)))', [celestialid,record.status,record.datestamp,record.identifier], function(err, result) {
-            if (err) {
-              p.reject(err);
-            }
-            else {
-              p.resolve(result.insertId);
-            }
-          });
-        }
-
-        return p;
-      })
-      .then(function(id) {
-        return commit(id);
-      })
-      .then(function(id) {
-        // commit the foreign key or we get deadlocks on the main table
-        var sql = [];
-
-        var terms = pmh.dcTerms();
-        for(var i = 0; i < terms.length; ++i) {
-          var table = 'dc_' + terms[i];
-          var term = terms[i];
-
-          sql.push('BEGIN');
-          sql.push('DELETE FROM ' + table + ' WHERE dcid=' + id);
-
-          if (record.dc[term] === undefined) {
-            sql.push('COMMIT');
-            continue;
-          }
-
-          var values = [];
-          for(var j=0; j < record.dc[term].length; ++j) {
-            values.push('(' + [
-                id,
-                j,
-                connection.escape(record.dc[term][j])
-              ].join(',') + ')');
-          }
-
-          sql.push('INSERT INTO ' + table + ' (dcid,pos,' + term + ') VALUES ' + values.join(','));
-          sql.push('COMMIT');
-        }
-
-        var promises = [];
-
-        while(sql.length > 0) {
-          // force a closure
-          (function(sql) {
-            promises.push(function() {
-              var p = new Promise();
-              connection.query(sql, [], function(err) {
-                if (err) {
-                  p.reject(err);
-                }
-                else {
-                  p.resolve(id);
-                }
-              });
-              return p;
-            });
-          })(sql.shift());
-        }
-
-        return promise.seq(promises);
-      })
-
-      // release the connection and report
-      .then(function(id) {
-        pool.release(connection);
-        //console.log(record.identifier);
-      }, function(err) {
-        // Deadlock
-        if (err.errno == 1213) {
-          // try again (that's what the MySQL manual says)
-          pool.release(connection);
-          _this.record(opts);
-        }
-        else {
-          connection.query('ROLLBACK', [], function() {
-            _this.log({
-              celestialid: celestialid,
-              harvester: harvester,
-              error: err
-            });
-            pool.release(connection);
-          });
-        }
-      });
-
-      first.resolve();
+      var dcid = result.insertId;
+      entry.dcid = dcid;
+      conn.query('INSERT INTO dc_header (dcid,pos,header_identifier) VALUES (' + dcid + ',0,?)', [record.identifier]);
+      p.resolve();
     }
   });
+
+  return p;
+};
+
+celestial.prototype.write = function(entries) {
+  var _this = this
+    , pool = this.pool
+  ;
+
+  var celestialids = {};
+  for(var i=0; i<entries.length; ++i) {
+    celestialids[entries[i].celestialid] = true;
+  }
+
+  var terms = pmh.dcTerms();
+
+  pool.acquire(function(err, connection) {
+    if (err) {
+      for(var celestialid in celestialids) {
+        _this.stop(celestialid);
+      }
+      _this.log({
+        error: err
+      });
+      return;
+    }
+
+    var first = new Promise();
+    first
+    .then(function() {
+      return promise.all(entries.map(function(entry) {
+        return _this.writeHeader(connection, entry);
+      }));
+    })
+    .then(function() {
+      return promise.all(terms.map(function(term) {
+        var p = new Promise();
+
+        var dcids = entries.map(function(entry) { return entry.dcid; });
+        connection.query('DELETE FROM dc_' + term + ' WHERE dcid IN (' + dcids.join(',') + ')', [], function(err) {
+          if (err) {
+            p.reject(err);
+          }
+          else {
+            p.resolve();
+          }
+        });
+
+        return p;
+      }));
+    })
+    .then(function() {
+      return promise.all(terms.map(function(term) {
+        var p = new Promise();
+
+        var subs = [];
+        var values = [];
+        for(var j=0; j<entries.length; ++j) {
+          var entry = entries[j];
+          var record = entry.record;
+          if (record.dc[term] === undefined)
+            continue;
+
+          for(var k=0; k<record.dc[term].length; ++k) {
+            subs.push('(' + [
+              entry.dcid,
+              k,
+              '?'
+            ].join(',') + ')');
+            values.push(record.dc[term][k]);
+          }
+        }
+
+        // nothing to do
+        if (values.length === 0)
+          return;
+
+        connection.query('INSERT INTO dc_' + term + ' (dcid,pos,' + term + ') VALUES ' + subs.join(','), values, function(err) {
+          if (err) {
+            p.reject(err);
+          }
+          else {
+            p.resolve();
+          }
+        });
+
+        return p;
+      }));
+    })
+    .then(function() {
+      _this.pool.release(connection);
+      0 && entries.map(function(entry) {
+        console.log(entry.celestialid, entry.dcid, entry.record.identifier);
+      });
+    }, function(err) {
+      for(var celestialid in celestialids) {
+        _this.stop(celestialid);
+      }
+      _this.log({
+        error: err
+      });
+      _this.pool.release(connection);
+    })
+    ;
+
+    first.resolve();
+  }, 0);
 };

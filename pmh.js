@@ -13,17 +13,11 @@ var Harvester = function(options) {
 
   this.headers = options.headers ? options.headers : {};
 
-  // state variables, useful for monitoring
-  this.state = {
-      status: 'Initialization',
-      request: null,
-      requests: 0,
-      records: 0,
-      start: 0
-    };
-
   // cache recent rtokens to spot unchanging tokens
   this.tokens = [];
+
+  // number of redirects followed
+  this.redirect_depth = 0;
 
   this.retries = 5;
 };
@@ -65,12 +59,6 @@ Harvester.prototype.request = function(endpoint, options) {
     return;
   }
 
-  // general state
-  if (this.state.start == 0) {
-    this.state.start = new Date().getTime();
-  }
-  this.state.requests++;
-
   var parser = new expat.Parser("UTF-8");
   this.parser = parser; // used to pause
 
@@ -89,6 +77,7 @@ Harvester.prototype.request = function(endpoint, options) {
   var path = [];
   var text = '';
   var record = {
+    status: null,
     dc: {},
     setSpec: []
   };
@@ -100,7 +89,8 @@ Harvester.prototype.request = function(endpoint, options) {
     path.push(localName);
     //console.log('<' + path.join('/') + '>');
     text = '';
-    if (path.join('/') === 'OAI-PMH/ListRecords/record/header' && record.status !== '') {
+    // only valid status is 'deleted'
+    if (path.join('/') === 'OAI-PMH/ListRecords/record/header' && attrs.status === 'deleted') {
       record.status = attrs.status;
     }
   });
@@ -124,8 +114,8 @@ Harvester.prototype.request = function(endpoint, options) {
     }
     else if (path.join('/') === 'OAI-PMH/ListRecords/record') {
       _this.emit('record', record);
-      _this.state.records++;
       record = {
+        status: null,
         dc: {},
         setSpec: []
       };
@@ -144,31 +134,27 @@ Harvester.prototype.request = function(endpoint, options) {
     _this.emit('error', e);
   });
 
-  //console.log(q.format());
-  _this.state.status = 'Requesting';
-  _this.state.statusCode = undefined;
+  _this.emit('request', q);
   var req = (q.protocol === 'http:' ? http : https).request(q.format(), function(res) {
-    _this.state.status = 'Receiving';
-    _this.state.statusCode = res.statusCode;
+    _this.emit('response', req, res);
     switch(res.statusCode) {
       case 200:
+        _this.redirect_depth = 0;
         res
         .on('data', function(data) {
           if (_this.paused) {
             req.abort();
             return;
           }
-          _this.state.status = 'Parsing';
+          _this.emit('response_data', data);
           parser.write(data);
-          _this.state.status = 'Receiving';
         })
         .on('end', function() {
           // tidy up parser
           parser.end();
           _this.parser = undefined;
      
-          _this.state.status = 'Finished';
-          _this.state.request = undefined;
+          _this.emit('response_end', req, res);
 
           // resume the partial list with the given token
           if (resumptionToken !== undefined && resumptionToken.length > 0) {
@@ -198,21 +184,26 @@ Harvester.prototype.request = function(endpoint, options) {
       case 302:
         var location = res.headers['location'];
         location = url.resolve(q.format(), location);
-        _this.state.status = 'Redirecting';
+        if (_this.redirect_depth++ > 5) {
+          _this.emit('error', 'Exceeded redirect limit: ' + location);
+          break;
+        }
+        _this.emit('redirect', location);
         _this.request(location, options);
         break;
       // retry-after
       case 503:
+        _this.redirect_depth = 0;
         var seconds = res.headers['retry-after'] + 0;
         if (seconds > 0 && seconds < 600) {
-          _this.state.status = 'Sleeping';
+          _this.emit('sleep', seconds * 1000);
           setTimeout(function() {
             _this.request(endpoint, options);
           }, (seconds + 5) * 1000);
           break;
         }
       default:
-        _this.emit('error', res.statusCode);
+        _this.emit('error', res.statusCode + ': ' + q.format());
     }
 
   }, this.headers);
@@ -220,6 +211,4 @@ Harvester.prototype.request = function(endpoint, options) {
     _this.emit('error', e);
   });
   req.end();
-
-  this.state.request = q.format();
 };

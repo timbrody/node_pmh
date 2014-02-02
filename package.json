@@ -13,6 +13,7 @@
     "generic-pool": "*",
     "mysql": "*",
     "node-promise": "*",
+    "socket.io": "*",
 	"express": "*"
   }
 }

@@ -43,6 +43,7 @@ roar.prototype.list = function(callback) {
     res.on('end', function() {
       var ids = buffer.split('\n');
       for(var i=0; i<ids.length; ++i) {
+        if (ids[i] === '') continue;
         var id = new Number(ids[i]);
         callback(id);
       }
